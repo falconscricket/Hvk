@@ -1,28 +1,19 @@
-"""
-handlers/leave.py — Cross-mode /leave dispatcher. Routes to the correct
-mode-specific leave handler based on the active match in this chat.
-"""
-from __future__ import annotations
-
 from telegram import Update
 from telegram.ext import ContextTypes
+from gamestate import get_match, remove_match, GamePhase
+from utils import user_mention
 
-from gamestate import GameMode
-from handlers import onevone, solo
-from handlers.common import get_match
+async def leave_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    match = get_match(chat_id)
+    if not match: return
 
-
-async def leave_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    match = get_match(context, update.effective_chat.id)
-    if match is None:
-        await update.message.reply_text("You're not in an active match here.")
-        return
-
-    if match.mode == GameMode.ONE_V_ONE:
-        await onevone.leave_command(update, context)
-    elif match.mode == GameMode.SOLO_TOURNAMENT:
-        await solo.leave_command(update, context)
-    else:
-        await update.message.reply_text(
-            "⚠️ /leave for Team Match rosters isn't wired up in this build yet."
-        )
+    user_id = update.effective_user.id
+    
+    if match.phase == GamePhase.LOBBY:
+        match.solo_players = [p for p in match.solo_players if p.user_id != user_id]
+        match.team_a = [p for p in match.team_a if p.user_id != user_id]
+        match.team_b = [p for p in match.team_b if p.user_id != user_id]
+        await update.message.reply_text(f"🚪 {user_mention(user_id, update.effective_user.first_name)} left the lobby.", parse_mode="HTML")
+        if not match.solo_players and not match.team_a and not match.team_b:
+            remove_match(chat_id)
