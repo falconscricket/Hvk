@@ -1,122 +1,107 @@
-"""
-gamestate.py — Enums and dataclasses describing an in-progress match.
-"""
-from __future__ import annotations
-
-import time
+import asyncio
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Optional
-
+from typing import Dict, List, Optional, Set
 
 class GameMode(Enum):
-    ONE_V_ONE = auto()
+    ONE_VS_ONE = auto()
     SOLO_TOURNAMENT = auto()
     TEAM_MATCH = auto()
 
-
 class GamePhase(Enum):
     LOBBY = auto()
+    OVER_SELECTION = auto()
     TOSS = auto()
     INNINGS_1 = auto()
     INNINGS_2 = auto()
-    COMPLETE = auto()
-
+    ENDED = auto()
 
 class Team(Enum):
-    A = "A"
-    B = "B"
-    NONE = None
-
+    A = "Team A"
+    B = "Team B"
 
 @dataclass
 class Player:
     user_id: int
-    first_name: str
+    name: str
     username: Optional[str] = None
-    team: Team = Team.NONE
-    roster_no: Optional[int] = None
-    runs: int = 0
-    balls_faced: int = 0
-    wickets_taken: int = 0
-    fouls: int = 0                 # foul count *within the current match*
-    eligible: bool = True          # False once removed (2nd foul / /leave)
-    is_out: bool = False           # dismissed for the current innings
-
-    @property
-    def strike_rate(self) -> float:
-        if self.balls_faced == 0:
-            return 0.0
-        return round(self.runs / self.balls_faced * 100, 2)
-
-
-@dataclass
-class BallEvent:
-    bowler_id: int
-    batter_id: int
-    bowler_input: str      # "1".."6" or "W"
-    batter_input: Optional[str]  # "0".."6", None if not yet resolved
     runs_scored: int = 0
-    is_wicket: bool = False
-    is_wide: bool = False
-    is_free_hit: bool = False
-    timestamp: float = field(default_factory=time.time)
-
-
-@dataclass
-class InningsState:
-    batting_order: list[int] = field(default_factory=list)   # user_ids, in order
-    bowling_order: list[int] = field(default_factory=list)
-    current_batter_idx: int = 0
-    current_bowler_idx: int = 0
-    total_runs: int = 0
-    legal_balls: int = 0
-    target: Optional[int] = None
-    over_length: int = 6           # legal balls per bowling spell (solo tournament: 1 or 3)
-    balls_this_spell: int = 0
-    last_bowler_numbers: list[str] = field(default_factory=list)  # for free-hit "lock" detection
-    consecutive_wickets_same_bowler: int = 0
-    free_hit_next: bool = False
-    ball_log: list[BallEvent] = field(default_factory=list)
-    pending_bowler_input: Optional[str] = None
-
+    balls_faced: int = 0
+    fours: int = 0
+    sixes: int = 0
+    wickets_taken: int = 0
+    overs_bowled_balls: int = 0
+    runs_conceded: int = 0
+    is_out: bool = False
+    foul_count: int = 0
+    ball_log: List[str] = field(default_factory=list)
 
 @dataclass
-class Match:
+class AuctionState:
+    auction_id: str
+    host_id: int
+    captains: Dict[int, str] = field(default_factory=dict)  # user_id -> team_name
+    purses: Dict[int, float] = field(default_factory=dict)
+    current_bid_player: Optional[str] = None
+    highest_bidder: Optional[int] = None
+    highest_bid: float = 0.0
+    unsold_pool: List[str] = field(default_factory=list)
+    is_paused: bool = False
+
+@dataclass
+class MatchState:
     chat_id: int
     mode: GameMode
     phase: GamePhase = GamePhase.LOBBY
-    created_by: int = 0
-    created_at: float = field(default_factory=time.time)
-    players: dict[int, Player] = field(default_factory=dict)   # user_id -> Player
-    innings_no: int = 1
-    innings1: InningsState = field(default_factory=InningsState)
-    innings2: InningsState = field(default_factory=InningsState)
-    powerplay_active: bool = False
     host_id: Optional[int] = None
-    winner_id: Optional[int] = None
-    result_text: Optional[str] = None
+    creator_id: Optional[int] = None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    
+    # Teams & Players
+    team_a: List[Player] = field(default_factory=list)
+    team_b: List[Player] = field(default_factory=list)
+    solo_players: List[Player] = field(default_factory=list)
+    
+    # Active Positions
+    current_batter: Optional[Player] = None
+    current_bowler: Optional[Player] = None
+    batter_index: int = 0
+    bowler_index: int = 0
+    
+    # Dynamic Game Settings
+    powerplay_active: bool = False
+    balls_per_over_setting: int = 6
+    total_overs_setting: int = 2
+    
+    # Game Mechanics State
+    current_innings: int = 1
+    target_runs: Optional[int] = None
+    innings_1_runs: int = 0
+    total_wickets_team_a: int = 0
+    total_wickets_team_b: int = 0
+    legal_balls_in_over: int = 0
+    current_over_number: int = 0
+    
+    # Delivery Engine Locks & Pending Values
+    pending_bowl_delivery: Optional[str] = None  # "0"-"6" or "W"
+    is_free_hit: bool = False
+    recent_bowler_wickets_consecutive: int = 0  # For hat-trick tracking
+    
+    # Captain Approval Flow
+    host_proposal_new_id: Optional[int] = None
+    host_proposal_approvals: Set[int] = field(default_factory=set)
 
-    @property
-    def current_innings(self) -> InningsState:
-        return self.innings1 if self.innings_no == 1 else self.innings2
+# Global memory-resident active game registry
+ACTIVE_MATCHES: Dict[int, MatchState] = {}
+AUCTIONS: Dict[int, AuctionState] = {}
 
-    def eligible_players(self) -> list[Player]:
-        return [p for p in self.players.values() if p.eligible]
+def get_match(chat_id: int) -> Optional[MatchState]:
+    return ACTIVE_MATCHES.get(chat_id)
 
-    def current_bowler_id(self) -> Optional[int]:
-        inn = self.current_innings
-        order = [uid for uid in inn.bowling_order if self.players[uid].eligible]
-        if not order:
-            return None
-        idx = inn.current_bowler_idx % len(order)
-        return order[idx]
+def create_match(chat_id: int, mode: GameMode, creator_id: int) -> MatchState:
+    match = MatchState(chat_id=chat_id, mode=mode, creator_id=creator_id)
+    ACTIVE_MATCHES[chat_id] = match
+    return match
 
-    def current_batter_id(self) -> Optional[int]:
-        inn = self.current_innings
-        order = [uid for uid in inn.batting_order
-                 if self.players[uid].eligible and not self.players[uid].is_out]
-        if not order:
-            return None
-        idx = inn.current_batter_idx % len(order)
-        return order[idx]
+def remove_match(chat_id: int):
+    ACTIVE_MATCHES.pop(chat_id, None)
