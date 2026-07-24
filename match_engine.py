@@ -1,147 +1,113 @@
-"""
-match_engine.py — Delivery evaluation, runs, wickets, strike/bowler rotation,
-target calculation, win/draw checks, batting-order advancement.
-"""
-from __future__ import annotations
+from gamestate import MatchState, Player, GamePhase, GameMode
+from utils import user_mention
+from notify import notify_event
+from scoreboard import render_scoreboard
 
-from dataclasses import dataclass
-from typing import Optional
+async def evaluate_delivery(bot, match: MatchState, bat_input: int) -> dict:
+    async with match.lock:
+        bowl_str = match.pending_bowl_delivery
+        match.pending_bowl_delivery = None  # Reset PM lock
+        
+        batter = match.current_batter
+        bowler = match.current_bowler
+        
+        result = {
+            "is_out": False,
+            "is_wide": False,
+            "runs": 0,
+            "media": None,
+            "text": "",
+            "match_ended": False
+        }
+        
+        if not batter or not bowler:
+            return result
 
-from config import POWERPLAY_BONUS_RUNS, POWERPLAY_ELIGIBLE_RUNS, WIDE_RUN_VALUE
-from gamestate import BallEvent, InningsState, Match, Player
+        # Handle Wide Ball
+        if bowl_str == "W":
+            result["is_wide"] = True
+            result["runs"] = 1
+            result["media"] = "WIDE"
+            if match.current_innings == 1:
+                match.innings_1_runs += 1
+            batter.runs_scored += 0 # Extras don't add to batsman
+            bowler.runs_conceded += 1
+            bowler.ball_log.append("W")
+            result["text"] = f"🚨 <b>WIDE BALL!</b> +1 Extra Run. {user_mention(bowler.user_id, bowler.name)} bowls again."
+            return result
 
+        bowl_input = int(bowl_str)
+        batter.balls_faced += 1
+        bowler.overs_bowled_balls += 1
 
-@dataclass
-class DeliveryResult:
-    event: BallEvent
-    runs_added: int
-    wicket: bool
-    wide: bool
-    free_hit_awarded_next: bool
-    match_ended: bool = False
-    result_text: Optional[str] = None
-    winner_id: Optional[int] = None
-    innings_ended: bool = False
+        # Check Out vs Runs
+        if bat_input == bowl_input:
+            if match.is_free_hit:
+                match.is_free_hit = False
+                result["media"] = "DOT"
+                result["text"] = f"🛡️ <b>FREE HIT SURVIVED!</b> {user_mention(batter.user_id, batter.name)} matched numbers but is NOT OUT!"
+                bowler.ball_log.append("0")
+            else:
+                result["is_out"] = True
+                batter.is_out = True
+                bowler.wickets_taken += 1
+                bowler.recent_bowler_wickets_consecutive += 1
+                match.recent_bowler_wickets_consecutive = bowler.recent_bowler_wickets_consecutive
+                
+                if match.current_innings == 1:
+                    match.total_wickets_team_a += 1
+                else:
+                    match.total_wickets_team_b += 1
+                    
+                bowler.ball_log.append("W")
+                result["media"] = "OUT"
+                result["text"] = f"☝️ <b>OUT!</b> {user_mention(batter.user_id, batter.name)} enters {bat_input} and is walking back to the pavilion!"
+        else:
+            bowler.recent_bowler_wickets_consecutive = 0
+            match.recent_bowler_wickets_consecutive = 0
+            runs = bat_input
+            
+            # Powerplay impact
+            if match.powerplay_active and runs in [4, 5, 6]:
+                runs += 2
+                result["text"] += "🔥 <b>POWERPLAY IMPACT! +2 Bonus Runs!</b>\n"
+                
+            if bat_input == 4:
+                batter.fours += 1
+                result["media"] = "FOUR"
+            elif bat_input == 6:
+                batter.sixes += 1
+                result["media"] = "SIX"
+            elif bat_input == 0:
+                result["media"] = "DOT"
 
+            # Check Free Hit Lock sequence (1-6 or 6-1)
+            if (bat_input == 1 and bowl_input == 6) or (bat_input == 6 and bowl_input == 1):
+                match.is_free_hit = True
+                result["media"] = "FREE_HIT"
+                result["text"] += "⚡ <b>FREE HIT TRIGGERED!</b> Next delivery is a Free Hit!\n"
 
-def _detect_free_hit_lock(inn: InningsState, new_number: str) -> bool:
-    """
-    House rule: if the bowler's current and immediately-previous legal delivery
-    form the pair {1, 6} (in either order), the NEXT ball is a Free Hit.
-    """
-    if new_number == "W":
-        return False
-    history = inn.last_bowler_numbers
-    if not history:
-        return False
-    prev = history[-1]
-    pair = {prev, new_number}
-    return pair == {"1", "6"}
+            batter.runs_scored += runs
+            bowler.runs_conceded += runs
+            bowler.ball_log.append(str(runs))
+            
+            if match.current_innings == 1:
+                match.innings_1_runs += runs
+            
+            result["runs"] = runs
+            result["text"] += f"🏏 {user_mention(batter.user_id, batter.name)} scores <b>{runs}</b> runs!"
 
+        if not result["is_wide"]:
+            match.legal_balls_in_over += 1
 
-def resolve_delivery(
-    match: Match,
-    bowler: Player,
-    batter: Player,
-    bowler_input: str,
-    batter_input: Optional[str] = None,
-) -> DeliveryResult:
-    """
-    Evaluate one completed delivery (bowler number/W + batter number already collected).
-    Mutates match/innings/player state in place and returns a summary.
-    """
-    inn = match.current_innings
-    is_wide = bowler_input == "W"
-    free_hit_this_ball = inn.free_hit_next
-    inn.free_hit_next = False
+        # Innings 2 Target Check
+        if match.current_innings == 2 and match.target_runs is not None:
+            team_b_score = sum(p.runs_scored for p in match.team_b) if match.mode == GameMode.TEAM_MATCH else batter.runs_scored
+            if team_b_score >= match.target_runs:
+                result["match_ended"] = True
+                match.phase = GamePhase.ENDED
+                result["media"] = "WIN"
+                result["text"] += f"\n\n🏆 <b>TARGET REACHED!</b> {user_mention(batter.user_id, batter.name)} wins the game!"
 
-    event = BallEvent(
-        bowler_id=bowler.user_id,
-        batter_id=batter.user_id,
-        bowler_input=bowler_input,
-        batter_input=batter_input,
-        is_wide=is_wide,
-        is_free_hit=free_hit_this_ball,
-    )
-
-    result = DeliveryResult(event=event, runs_added=0, wicket=False, wide=is_wide,
-                            free_hit_awarded_next=False)
-
-    if is_wide:
-        inn.total_runs += WIDE_RUN_VALUE
-        event.runs_scored = WIDE_RUN_VALUE
-        result.runs_added = WIDE_RUN_VALUE
-        # Wides do not increment legal ball count and do not consume the batter's turn.
-        _maybe_check_target(match, inn, result)
         return result
-
-    # Legal delivery.
-    inn.legal_balls += 1
-    inn.balls_this_spell += 1
-    batter.balls_faced += 1
-
-    is_wicket = (bowler_input == batter_input) and not free_hit_this_ball
-
-    if is_wicket:
-        event.is_wicket = True
-        result.wicket = True
-        batter.is_out = True
-        bowler.wickets_taken += 1
-        inn.consecutive_wickets_same_bowler += 1
-    else:
-        runs = int(batter_input)
-        if match.powerplay_active and runs in POWERPLAY_ELIGIBLE_RUNS:
-            runs += POWERPLAY_BONUS_RUNS
-        batter.runs += runs
-        inn.total_runs += runs
-        event.runs_scored = runs
-        result.runs_added = runs
-        inn.consecutive_wickets_same_bowler = 0
-
-    # Free-hit "lock" detection based on this bowler's number sequence.
-    if _detect_free_hit_lock(inn, bowler_input):
-        inn.free_hit_next = True
-        result.free_hit_awarded_next = True
-
-    inn.last_bowler_numbers.append(bowler_input)
-    inn.ball_log.append(event)
-
-    _maybe_check_target(match, inn, result)
-    return result
-
-
-def _maybe_check_target(match: Match, inn: InningsState, result: DeliveryResult) -> None:
-    """Innings-2 only: check instant win/draw the moment target math resolves."""
-    if match.innings_no != 2 or inn.target is None:
-        return
-    if inn.total_runs >= inn.target:
-        result.match_ended = True
-        result.innings_ended = True
-        result.result_text = "batter_win"
-        # winner_id filled in by caller (needs current batter identity at call site)
-
-
-def check_bowler_rotation_due(inn: InningsState) -> bool:
-    """True once the current bowler has completed their spell (over_length legal balls)."""
-    return inn.balls_this_spell >= inn.over_length
-
-
-def advance_bowler(inn: InningsState) -> None:
-    inn.current_bowler_idx += 1
-    inn.balls_this_spell = 0
-    inn.last_bowler_numbers = []
-
-
-def advance_batter_after_wicket(inn: InningsState) -> None:
-    inn.current_batter_idx += 1
-
-
-def start_innings_2(match: Match, target_runs: int) -> None:
-    match.innings_no = 2
-    match.innings2.target = target_runs + 1
-    match.phase_note = "innings2"
-
-
-def hat_trick_zero_forbidden(inn: InningsState) -> bool:
-    """Batter cannot enter 0 immediately following back-to-back wickets by the same bowler."""
-    return inn.consecutive_wickets_same_bowler >= 2
+        
