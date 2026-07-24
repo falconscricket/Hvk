@@ -1,51 +1,49 @@
-"""
-database.py — Persistent JSON storage manager for player stats.
-(Media assets have their own dedicated store in media.py.)
-"""
-from __future__ import annotations
-
-import json
 import os
-from typing import Any
+import sqlite3
+import aiosqlite
+import json
+from config import DATABASE_PATH, MEDIA_ASSETS_PATH
 
-import aiofiles
+class DatabaseManager:
+    def __init__(self, db_path: str = DATABASE_PATH):
+        self.db_path = db_path
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
 
-from config import DATA_DIR, PLAYER_STATS_FILE
+    async def init_db(self):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS player_stats (
+                    user_id INTEGER PRIMARY KEY,
+                    matches INTEGER DEFAULT 0,
+                    runs INTEGER DEFAULT 0,
+                    wickets INTEGER DEFAULT 0,
+                    fours INTEGER DEFAULT 0,
+                    sixes INTEGER DEFAULT 0
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS auction_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    auction_id TEXT,
+                    player_name TEXT,
+                    sold_to TEXT,
+                    amount REAL
+                )
+            """)
+            await db.commit()
 
-_lock_file_init_done = False
+    async def update_stats(self, user_id: int, runs: int, wickets: int, fours: int, sixes: int):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                INSERT INTO player_stats (user_id, matches, runs, wickets, fours, sixes)
+                VALUES (?, 1, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    matches = matches + 1,
+                    runs = runs + excluded.runs,
+                    wickets = wickets + excluded.wickets,
+                    fours = fours + excluded.fours,
+                    sixes = sixes + excluded.sixes
+            """, (user_id, runs, wickets, fours, sixes))
+            await db.commit()
 
-
-def _ensure_data_dir() -> None:
-    os.makedirs(DATA_DIR, exist_ok=True)
-    if not os.path.exists(PLAYER_STATS_FILE):
-        with open(PLAYER_STATS_FILE, "w") as f:
-            json.dump({}, f)
-
-
-async def load_player_stats() -> dict[str, Any]:
-    _ensure_data_dir()
-    async with aiofiles.open(PLAYER_STATS_FILE, "r") as f:
-        raw = await f.read()
-    try:
-        return json.loads(raw) if raw.strip() else {}
-    except json.JSONDecodeError:
-        return {}
-
-
-async def save_player_stats(stats: dict[str, Any]) -> None:
-    _ensure_data_dir()
-    async with aiofiles.open(PLAYER_STATS_FILE, "w") as f:
-        await f.write(json.dumps(stats, indent=2))
-
-
-async def record_match_result(player_id: int, runs: int, wickets: int, won: bool) -> None:
-    """Update a single player's cumulative career stats after a match ends."""
-    stats = await load_player_stats()
-    key = str(player_id)
-    entry = stats.get(key, {"matches": 0, "runs": 0, "wickets": 0, "wins": 0})
-    entry["matches"] += 1
-    entry["runs"] += runs
-    entry["wickets"] += wickets
-    entry["wins"] += 1 if won else 0
-    stats[key] = entry
-    await save_player_stats(stats)
+db_manager = DatabaseManager()
